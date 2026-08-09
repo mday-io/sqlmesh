@@ -118,7 +118,7 @@ from sqlmesh.core.test import (
     filter_tests_by_patterns,
 )
 from sqlmesh.core.user import User
-from sqlmesh.utils import UniqueKeyDict, Verbosity
+from sqlmesh.utils import CorrelationId, UniqueKeyDict, Verbosity
 from sqlmesh.utils.concurrency import concurrent_apply_to_values
 from sqlmesh.utils.dag import DAG
 from sqlmesh.utils.date import (
@@ -492,6 +492,7 @@ class GenericContext(BaseContext, t.Generic[C]):
     @property
     def snapshot_evaluator(self) -> SnapshotEvaluator:
         if not self._snapshot_evaluator:
+            self._ensure_virtual_catalog_injection()
             self._snapshot_evaluator = SnapshotEvaluator(
                 {
                     gateway: adapter.with_settings(execute_log_level=logging.INFO)
@@ -501,6 +502,15 @@ class GenericContext(BaseContext, t.Generic[C]):
                 selected_gateway=self.selected_gateway,
             )
         return self._snapshot_evaluator
+
+    def _ensure_virtual_catalog_injection(self) -> None:
+        """Ensure virtual catalog injection has run before adapters are cloned for SnapshotEvaluator.
+
+        Injection is a side effect of get_default_catalog_per_gateway. In normal usage it fires
+        earlier (default_catalog is accessed during model loading), but this guard covers the edge
+        case where snapshot_evaluator is accessed directly on a fresh context before any model ops.
+        """
+        _ = self.default_catalog_per_gateway
 
     def execution_context(
         self,
@@ -801,6 +811,9 @@ class GenericContext(BaseContext, t.Generic[C]):
             engine_type=self.snapshot_evaluator.adapter.dialect,
             state_sync_type=self.state_sync.state_type(),
         )
+        snapshot_evaluator = self.snapshot_evaluator.set_correlation_id(
+            CorrelationId.from_run_id(analytics_run_id)
+        )
         self._load_materializations()
 
         env_check_attempts_num = max(
@@ -853,6 +866,7 @@ class GenericContext(BaseContext, t.Generic[C]):
                     select_models=select_models,
                     circuit_breaker=_has_environment_changed,
                     no_auto_upstream=no_auto_upstream,
+                    snapshot_evaluator=snapshot_evaluator,
                 )
                 done = True
             except CircuitBreakerError:
@@ -1440,6 +1454,8 @@ class GenericContext(BaseContext, t.Generic[C]):
 
         plan = plan_builder.build()
 
+        self._warn_if_virtual_catalog_rematerialization(plan)
+
         if no_auto_categorization or plan.uncategorized:
             # Prompts are required if the auto categorization is disabled
             # or if there are any uncategorized snapshots in the plan
@@ -1708,6 +1724,25 @@ class GenericContext(BaseContext, t.Generic[C]):
                 modified_model_names,
                 execution_time or now(),
             )
+
+            execution_time_ts = to_timestamp(execution_time) if execution_time is not None else None
+            if (
+                execution_time_ts is not None
+                and end is None
+                and default_end is not None
+                and execution_time_ts > default_end
+            ):
+                # An explicit execution time is the plan's effective "now", so the default end may
+                # extend past the recorded prod frontier (as an explicit `end` already does via
+                # PlanBuilder.override_end). Raising every per-model cap to it keeps a plain
+                # `plan --execution-time X` in step with `plan --run --execution-time X`, which
+                # already runs with no caps.
+                default_end = execution_time_ts
+                execution_time_dt = to_datetime(execution_time_ts)
+                max_interval_end_per_model = {
+                    model_fqn: max(interval_end, execution_time_dt)
+                    for model_fqn, interval_end in max_interval_end_per_model.items()
+                }
 
             # Refresh snapshot intervals to ensure that they are up to date with values reflected in the max_interval_end_per_model.
             self.state_sync.refresh_snapshot_intervals(context_diff.snapshots.values())
@@ -2574,8 +2609,9 @@ class GenericContext(BaseContext, t.Generic[C]):
         select_models: t.Optional[t.Collection[str]],
         circuit_breaker: t.Optional[t.Callable[[], bool]],
         no_auto_upstream: bool,
+        snapshot_evaluator: t.Optional[SnapshotEvaluator] = None,
     ) -> CompletionStatus:
-        scheduler = self.scheduler(environment=environment)
+        scheduler = self.scheduler(environment=environment, snapshot_evaluator=snapshot_evaluator)
         snapshots = scheduler.snapshots
 
         if select_models is not None:
@@ -2745,6 +2781,61 @@ class GenericContext(BaseContext, t.Generic[C]):
                 )
             return result
         return None
+
+    def _warn_if_virtual_catalog_rematerialization(self, plan: "Plan") -> None:
+        """Warn when ClickHouse models appear as new snapshots solely because a virtual catalog
+        prefix was added to their FQNs after a catalog-aware gateway joined the project.
+
+        This situation causes every previously-applied ClickHouse model to be treated as brand-new
+        by SQLMesh, triggering full re-materialization and historical backfills. Emitting a warning
+        before the plan is displayed gives users a chance to understand the cost before applying.
+        """
+        from sqlglot import exp
+
+        # Collect the set of old 2-level snapshot names from the current environment so we can
+        # detect which new 3-level names are renames rather than genuinely new models.
+        old_names: t.Set[str] = set()
+        for s_id in plan.context_diff.removed_snapshots:
+            old_names.add(s_id.name)
+        for name in plan.context_diff.snapshots_by_name:
+            old_names.add(name)
+
+        affected: t.List[t.Tuple[str, str]] = []  # (new_3level_name, old_2level_name)
+
+        for gateway, adapter in self.engine_adapters.items():
+            if not adapter.supports_virtual_catalog() or not adapter._default_catalog:
+                continue
+            virtual_catalog = adapter._default_catalog
+
+            for snapshot in plan.new_snapshots:
+                table = exp.to_table(snapshot.name)
+                if table.catalog != virtual_catalog:
+                    continue
+                # Reconstruct the 2-level name that would have been used before injection.
+                old_name = f"{table.db}.{table.name}"
+                if old_name in old_names:
+                    affected.append((snapshot.name, old_name))
+
+        if not affected:
+            return
+
+        max_display = 10
+        model_lines = "\n".join(
+            f"  - {new_name}  (was: {old_name})" for new_name, old_name in affected[:max_display]
+        )
+        if len(affected) > max_display:
+            model_lines += f"\n  ... and {len(affected) - max_display} more"
+
+        self.console.log_warning(
+            "ClickHouse models are being re-materialized due to virtual catalog FQN change.\n\n"
+            "The following ClickHouse models appear as new because their fully-qualified\n"
+            "names changed from 2-level (db.table) to 3-level (__gateway__.db.table):\n\n"
+            f"{model_lines}\n\n"
+            "FULL models will be recreated once. INCREMENTAL_BY_TIME_RANGE models will\n"
+            "require a full historical backfill from their configured start date.\n\n"
+            "This is a one-time cost when first adding a catalog-aware gateway to an\n"
+            "existing ClickHouse project. To proceed, run `sqlmesh apply`."
+        )
 
     @property
     def _model_tables(self) -> t.Dict[str, str]:
@@ -2979,10 +3070,17 @@ class GenericContext(BaseContext, t.Generic[C]):
             expired_env = self.state_reader.get_environment(expired_env_summary.name)
 
             if expired_env:
+                cleanup_default_adapter, cleanup_engine_adapters, failure = (
+                    self._cleanup_adapters_for_environment(expired_env)
+                )
+                if failure:
+                    logger.warning(failure)
+                    failures.append(failure)
+                    continue
                 failures.extend(
                     cleanup_expired_views(
-                        default_adapter=self.engine_adapter,
-                        engine_adapters=self.engine_adapters,
+                        default_adapter=cleanup_default_adapter,
+                        engine_adapters=cleanup_engine_adapters,
                         environments=[expired_env],
                         console=self.console,
                     )
@@ -2993,6 +3091,62 @@ class GenericContext(BaseContext, t.Generic[C]):
         if not failures or force_delete:
             self.state_sync.delete_expired_environments(current_ts=current_ts, name=name)
         return failures
+
+    def _cleanup_adapters_for_environment(
+        self, environment: Environment
+    ) -> t.Tuple[EngineAdapter, t.Dict[str, EngineAdapter], t.Optional[str]]:
+        """Create cleanup-scoped adapters for an expired environment.
+
+        Persisted catalog-qualified view names indicate that virtual catalog injection was active,
+        so cleanup can clone only the selected adapters with the historical catalog and leave the
+        context's adapters unchanged.
+        """
+        engine_adapters = self.engine_adapters
+        default_adapter = self.engine_adapter
+        catalogs_by_gateway: t.Dict[str, t.Set[str]] = collections.defaultdict(set)
+
+        for snapshot in environment.snapshots:
+            if not snapshot.is_model or snapshot.is_symbolic:
+                continue
+
+            gateway = (
+                snapshot.model_gateway
+                if environment.gateway_managed and snapshot.model_gateway in engine_adapters
+                else self.selected_gateway
+            )
+            adapter = engine_adapters.get(gateway, default_adapter)
+            catalog = snapshot.qualified_view_name.catalog_for_environment(
+                environment.naming_info, dialect=adapter.dialect
+            )
+            if catalog and adapter.supports_virtual_catalog() is True:
+                catalogs_by_gateway[gateway].add(catalog)
+
+        for gateway, catalogs in catalogs_by_gateway.items():
+            if len(catalogs) > 1:
+                catalogs_description = ", ".join(f"'{catalog}'" for catalog in sorted(catalogs))
+                return (
+                    default_adapter,
+                    engine_adapters,
+                    (
+                        f"Failed to clean up expired environment '{environment.name}': gateway "
+                        f"'{gateway}' references multiple virtual catalogs: {catalogs_description}"
+                    ),
+                )
+
+        cleanup_engine_adapters = engine_adapters.copy()
+        cleanup_default_adapter = default_adapter
+        for gateway, catalogs in catalogs_by_gateway.items():
+            cleanup_adapter = engine_adapters.get(gateway, default_adapter).with_settings()
+            cleanup_adapter.inject_virtual_catalog(gateway)
+            # inject_virtual_catalog() may initialize adapter-specific state in addition to
+            # _default_catalog. Override only the cleanup clone with the catalog persisted in the
+            # expired environment so historical names pass SINGLE_CATALOG_ONLY validation.
+            cleanup_adapter._default_catalog = next(iter(catalogs))
+            cleanup_engine_adapters[gateway] = cleanup_adapter
+            if gateway == self.selected_gateway:
+                cleanup_default_adapter = cleanup_adapter
+
+        return cleanup_default_adapter, cleanup_engine_adapters, None
 
     def _try_connection(self, connection_name: str, validator: t.Callable[[], None]) -> None:
         connection_name = connection_name.capitalize()

@@ -24,7 +24,7 @@ from sqlglot.optimizer.scope import traverse_scope
 from sqlglot.schema import MappingSchema
 from sqlglot.tokens import Token
 
-from sqlmesh.core.constants import MAX_MODEL_DEFINITION_SIZE
+from sqlmesh.core.constants import LIQUID_CLUSTERING_KEYWORDS, MAX_MODEL_DEFINITION_SIZE
 from sqlmesh.utils import get_source_columns_to_types
 from sqlmesh.utils.errors import SQLMeshError, ConfigError
 from sqlmesh.utils.pandas import columns_to_types_from_df
@@ -551,6 +551,36 @@ def _parse_table_parts(
     return table
 
 
+# Only needed for T-SQL: it spells a column's nullability right after its type, e.g.
+# ALTER TABLE t ALTER COLUMN c INT NOT NULL. Without this the trailing clause is left
+# over, so the whole statement falls back to a Command and any macros it contains (such as
+# @this_model) are no longer resolved, which means they reach the engine verbatim.
+#
+# See: https://learn.microsoft.com/en-us/sql/t-sql/statements/alter-table-transact-sql
+def _parse_alter_table_alter(self: Parser) -> t.Optional[exp.Expr]:
+    alter_column = self.__parse_alter_table_alter()  # type: ignore
+
+    if isinstance(alter_column, exp.AlterColumn) and alter_column.args.get("dtype"):
+        if self._match_pair(TokenType.NOT, TokenType.NULL):
+            alter_column.set("allow_null", False)
+        elif self._match(TokenType.NULL):
+            alter_column.set("allow_null", True)
+
+    return alter_column
+
+
+def altercolumn_sql(self: Generator, expression: exp.AlterColumn) -> str:
+    sql = self._altercolumn_sql(expression)  # type: ignore
+
+    # sqlglot's generator returns as soon as it renders the type, so the nullability parsed
+    # above has to be appended here
+    allow_null = expression.args.get("allow_null")
+    if expression.args.get("dtype") and allow_null is not None:
+        sql = f"{sql} NULL" if allow_null else f"{sql} NOT NULL"
+
+    return sql
+
+
 def _parse_if(self: Parser) -> t.Optional[exp.Expr]:
     # If we fail to parse an IF function with expressions as arguments, we then try
     # to parse a statement / command to support the macro @IF(condition, statement)
@@ -663,6 +693,27 @@ def _create_parser(expression_type: t.Type[exp.Expr], table_keys: t.List[str]) -
                     value = exp.tuple_(*partitioned_by.this.expressions)
                 else:
                     value = partitioned_by.this
+            elif key == "clustered_by":
+                # Bare AUTO / NONE are Databricks liquid clustering keywords, not column refs.
+                # Detect keywords by token type: unquoted bare identifiers arrive as VAR tokens.
+                # Backtick-quoted identifiers (e.g. `auto`) have IDENTIFIER token type and are
+                # treated as real column names.
+                if (
+                    self._curr is not None
+                    and self._curr.token_type == TokenType.VAR
+                    and self._curr.text.upper() in LIQUID_CLUSTERING_KEYWORDS
+                ):
+                    value = exp.Var(this=self._curr.text.upper())
+                    self._advance()
+                else:
+                    parsed = self._parse_bracket(self._parse_field(any_token=True))
+                    # Unwrap Paren wrapping a bare column to match partitioned_by normalisation:
+                    # clustered_by (a) → stored as Column(a), not Paren(Column(a)).
+                    # Preserve parens around function expressions: (TO_DATE(col)) stays as-is.
+                    if isinstance(parsed, exp.Paren) and isinstance(parsed.this, exp.Column):
+                        value = parsed.unnest()
+                    else:
+                        value = parsed
             else:
                 value = self._parse_bracket(self._parse_field(any_token=True))
 
@@ -759,8 +810,12 @@ def _parse_interval_span(self: Parser, this: exp.Expr) -> exp.Interval:
     return interval
 
 
-def _override(klass: t.Type[Tokenizer | Parser], func: t.Callable) -> None:
+def _override(klass: t.Type[Tokenizer | Parser | Generator], func: t.Callable) -> None:
     name = func.__name__
+    if getattr(klass, name, None) is func:
+        # Already overridden. Re-applying would save the override itself as the
+        # "original", making the wrapper call itself and recurse infinitely.
+        return
     setattr(klass, f"_{name}", getattr(klass, name))
     setattr(klass, name, func)
 
@@ -769,6 +824,7 @@ def format_model_expressions(
     expressions: t.List[exp.Expr],
     dialect: t.Optional[str] = None,
     rewrite_casts: bool = True,
+    normalize_functions: t.Union[str, bool, None] = False,
     **kwargs: t.Any,
 ) -> str:
     """Format a model's expressions into a standardized format.
@@ -777,13 +833,33 @@ def format_model_expressions(
         expressions: The model's expressions, must be at least model def + query.
         dialect: The dialect to render the expressions as.
         rewrite_casts: Whether to rewrite all casts to use the :: syntax.
+        normalize_functions: How to normalize function name casing.
+
+            * ``False`` (default) — preserves the original spelling of custom and audit
+              function names.  SQLGlot built-in functions may still canonicalize because
+              the parser discards the original token.
+            * ``"upper"`` — uppercases all function names including custom audit
+              references.
+            * ``"lower"`` — lowercases all function names including built-ins.
+            * ``True`` — defers to SQLGlot's generator default (uppercase).
+            * ``None`` — passes ``None`` directly to the SQLGlot generator, which
+              defers to SQLGlot's own default (typically uppercase, but may vary by
+              dialect).  Note: this is the **direct generator API** behaviour.  When
+              called via ``FormatConfig``, ``None`` is excluded by Pydantic's
+              ``exclude_none`` serialization and this function receives its own ``False``
+              default instead — so the two paths are not equivalent.
         **kwargs: Additional keyword arguments to pass to the sql generator.
 
     Returns:
         A string representing the formatted model.
     """
     if len(expressions) == 1 and is_meta_expression(expressions[0]):
-        return expressions[0].sql(pretty=True, dialect=dialect)
+        # Meta expressions (MODEL/AUDIT/METRIC) are SQLMesh DDL, not standard SQL,
+        # so they must never be transpiled to the target dialect (e.g. tsql would
+        # rewrite a boolean property like `allow_partials TRUE` to `(1 = 1)`).
+        return expressions[0].sql(
+            pretty=True, dialect=None, normalize_functions=normalize_functions
+        )
 
     if rewrite_casts:
 
@@ -815,7 +891,15 @@ def format_model_expressions(
         expressions = new_expressions
 
     return ";\n\n".join(
-        expression.sql(pretty=True, dialect=dialect, **kwargs) for expression in expressions
+        # Meta expressions (MODEL/AUDIT/METRIC) are SQLMesh DDL and must stay
+        # dialect-agnostic; only the actual query/statement expressions transpile.
+        expression.sql(
+            pretty=True,
+            dialect=None if is_meta_expression(expression) else dialect,
+            normalize_functions=normalize_functions,
+            **kwargs,
+        )
+        for expression in expressions
     ).strip()
 
 
@@ -1120,11 +1204,12 @@ def extend_sqlglot() -> None:
                 MacroDef,
             )
 
-        generator.UNWRAPPED_INTERVAL_VALUES = (
-            *generator.UNWRAPPED_INTERVAL_VALUES,
-            MacroStrReplace,
-            MacroVar,
-        )
+        if MacroVar not in generator.UNWRAPPED_INTERVAL_VALUES:
+            generator.UNWRAPPED_INTERVAL_VALUES = (
+                *generator.UNWRAPPED_INTERVAL_VALUES,
+                MacroStrReplace,
+                MacroVar,
+            )
 
     _override(Parser, _parse_select)
     _override(Parser, _parse_statement)
@@ -1144,6 +1229,8 @@ def extend_sqlglot() -> None:
     _override(Parser, _parse_interval_span)
     _override(Parser, _warn_unsupported)
     _override(Snowflake.Parser, _parse_table_parts)
+    _override(TSQL.Parser, _parse_alter_table_alter)
+    _override(TSQL.Generator, altercolumn_sql)
 
     # DuckDB's prefix absolute power operator `@` clashes with the macro syntax
     DuckDB.Parser.NO_PAREN_FUNCTION_PARSERS.pop("@", None)

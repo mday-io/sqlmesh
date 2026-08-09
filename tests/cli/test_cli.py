@@ -263,6 +263,44 @@ def test_plan_skip_backfill(runner, tmp_path, flag):
     assert "Model batches executed" not in result.output
 
 
+def test_plan_min_intervals(runner, tmp_path):
+    create_example_project(tmp_path)
+
+    # build prod so the dev plan below has a baseline to diff against
+    runner.invoke(
+        cli,
+        ["--log-file-dir", tmp_path, "--paths", tmp_path, "plan", "--no-prompts", "--auto-apply"],
+    )
+    update_incremental_model(tmp_path)
+
+    # --min-intervals must be coerced to int; otherwise the string reaches
+    # range() in _calculate_start_override_per_model and raises TypeError
+    result = runner.invoke(
+        cli,
+        [
+            "--log-file-dir",
+            tmp_path,
+            "--paths",
+            tmp_path,
+            "plan",
+            "dev",
+            "--no-prompts",
+            "--auto-apply",
+            "--min-intervals",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    # a non-integer value is rejected by click, not surfaced as a traceback
+    result = runner.invoke(
+        cli,
+        ["--log-file-dir", tmp_path, "--paths", tmp_path, "plan", "dev", "--min-intervals", "abc"],
+    )
+    assert result.exit_code == 2
+    assert "is not a valid integer" in result.output
+
+
 def test_plan_auto_apply(runner, tmp_path):
     create_example_project(tmp_path)
 
@@ -921,7 +959,7 @@ SELECT
 FROM
   filesystem_pipeline_dataset.equipment as c
 WHERE
-  TO_TIMESTAMP(CAST(c._dlt_load_id AS DOUBLE)) BETWEEN @start_ds AND @end_ds
+  TO_TIMESTAMP(CAST(c._dlt_load_id AS DOUBLE)) BETWEEN @start_ts AND @end_ts
 """
 
     with open(equipment_model_path) as file:
@@ -995,7 +1033,7 @@ def test_dlt_pipeline(runner, tmp_path):
         exec(file.read())
 
     # This should fail since it won't be able to locate the pipeline in this path
-    with pytest.raises(ClickException, match=r".*Could not attach to pipeline*"):
+    with pytest.raises(ClickException, match=r".*Could not attach to pipeline*") as excinfo:
         init_example_project(
             tmp_path,
             "duckdb",
@@ -1003,6 +1041,12 @@ def test_dlt_pipeline(runner, tmp_path):
             pipeline="sushi",
             dlt_path="./dlt2/pipelines",
         )
+
+    # The error should surface where the pipeline was searched for and, since the
+    # pipeline exists in the default working directory, a hint about --dlt-path
+    error_message = str(excinfo.value)
+    assert "Searched in: ./dlt2/pipelines" in error_message
+    assert "Try omitting --dlt-path" in error_message
 
     # By setting the pipelines path where the pipeline directory is located, it should work
     dlt_path = get_dlt_pipelines_dir()
@@ -1058,7 +1102,7 @@ SELECT
 FROM
   sushi_dataset.sushi_types as c
 WHERE
-  TO_TIMESTAMP(CAST(c._dlt_load_id AS DOUBLE)) BETWEEN @start_ds AND @end_ds
+  TO_TIMESTAMP(CAST(c._dlt_load_id AS DOUBLE)) BETWEEN @start_ts AND @end_ts
 """
 
     dlt_sushi_types_model_path = tmp_path / "models/incremental_sushi_types.sql"
@@ -1089,7 +1133,7 @@ SELECT
 FROM
   sushi_dataset._dlt_loads as c
 WHERE
-  TO_TIMESTAMP(CAST(c.load_id AS DOUBLE)) BETWEEN @start_ds AND @end_ds
+  TO_TIMESTAMP(CAST(c.load_id AS DOUBLE)) BETWEEN @start_ts AND @end_ts
 """
 
     with open(dlt_loads_model_path) as file:
@@ -1116,7 +1160,7 @@ JOIN
 ON
   c._dlt_parent_id = p._dlt_id
 WHERE
-  TO_TIMESTAMP(CAST(p._dlt_load_id AS DOUBLE)) BETWEEN @start_ds AND @end_ds
+  TO_TIMESTAMP(CAST(p._dlt_load_id AS DOUBLE)) BETWEEN @start_ts AND @end_ts
 """
 
     with open(dlt_sushi_fillings_model_path) as file:
@@ -1948,7 +1992,7 @@ def test_init_dbt_template(runner: CliRunner, tmp_path: Path):
 @time_machine.travel(FREEZE_TIME)
 def test_init_project_engine_configs(tmp_path):
     engine_type_to_config = {
-        "redshift": "# concurrent_tasks: 4\n      # register_comments: True\n      # pre_ping: False\n      # pretty_sql: False\n      # schema_differ_overrides: \n      # catalog_type_overrides: \n      # user: \n      # password: \n      # database: \n      # host: \n      # port: \n      # source_address: \n      # unix_sock: \n      # ssl: \n      # sslmode: \n      # timeout: \n      # tcp_keepalive: \n      # application_name: \n      # preferred_role: \n      # principal_arn: \n      # credentials_provider: \n      # region: \n      # cluster_identifier: \n      # iam: \n      # is_serverless: \n      # serverless_acct_id: \n      # serverless_work_group: \n      # enable_merge: ",
+        "redshift": "# concurrent_tasks: 4\n      # register_comments: True\n      # pre_ping: False\n      # pretty_sql: False\n      # schema_differ_overrides: \n      # catalog_type_overrides: \n      # user: \n      # password: \n      # database: \n      # host: \n      # port: \n      # source_address: \n      # unix_sock: \n      # ssl: \n      # sslmode: \n      # timeout: \n      # tcp_keepalive: \n      # application_name: \n      # preferred_role: \n      # principal_arn: \n      # credentials_provider: \n      # region: \n      # cluster_identifier: \n      # iam: \n      # db_user: \n      # is_serverless: \n      # serverless_acct_id: \n      # serverless_work_group: \n      # enable_merge: ",
         "bigquery": "# concurrent_tasks: 1\n      # register_comments: True\n      # pre_ping: False\n      # pretty_sql: False\n      # schema_differ_overrides: \n      # catalog_type_overrides: \n      # method: oauth\n      # project: \n      # execution_project: \n      # quota_project: \n      # location: \n      # keyfile: \n      # keyfile_json: \n      # token: \n      # refresh_token: \n      # client_id: \n      # client_secret: \n      # token_uri: \n      # scopes: \n      # impersonated_service_account: \n      # job_creation_timeout_seconds: \n      # job_execution_timeout_seconds: \n      # job_retries: 1\n      # job_retry_deadline_seconds: \n      # priority: \n      # maximum_bytes_billed: \n      # reservation: ",
         "snowflake": "account: \n      # concurrent_tasks: 4\n      # register_comments: True\n      # pre_ping: False\n      # pretty_sql: False\n      # schema_differ_overrides: \n      # catalog_type_overrides: \n      # user: \n      # password: \n      # warehouse: \n      # database: \n      # role: \n      # authenticator: \n      # token: \n      # host: \n      # port: \n      # application: Tobiko_SQLMesh\n      # private_key: \n      # private_key_path: \n      # private_key_passphrase: \n      # session_parameters: ",
         "databricks": "# concurrent_tasks: 1\n      # register_comments: True\n      # pre_ping: False\n      # pretty_sql: False\n      # schema_differ_overrides: \n      # catalog_type_overrides: \n      # server_hostname: \n      # http_path: \n      # access_token: \n      # auth_type: \n      # oauth_client_id: \n      # oauth_client_secret: \n      # catalog: \n      # http_headers: \n      # session_configuration: \n      # databricks_connect_server_hostname: \n      # databricks_connect_access_token: \n      # databricks_connect_cluster_id: \n      # databricks_connect_use_serverless: False\n      # force_databricks_connect: False\n      # disable_databricks_connect: False\n      # disable_spark_session: False",
@@ -2297,6 +2341,24 @@ def test_lint_still_loads_state(runner: CliRunner, tmp_path: Path, mocker):
             f"Context was constructed with load_state={call.kwargs['load_state']} for `lint`"
         )
     assert mock.called, "state-sync was never accessed during `lint`"
+
+
+def test_lint_local_runs_without_state(runner: CliRunner, tmp_path: Path, mocker):
+    mock = _setup_local_only_project(tmp_path, mocker)
+    init_spy = mocker.spy(Context, "__init__")
+
+    result = runner.invoke(cli, ["--paths", str(tmp_path), "lint", "--local"])
+
+    assert result.exit_code == 0, f"Lint failed: {result.output}\nException: {result.exception}"
+    assert init_spy.called, "Context was never constructed"
+    for call in init_spy.call_args_list:
+        assert "load_state" in call.kwargs, (
+            "CLI didn't pass load_state= explicitly; missing kwarg defaults to True silently"
+        )
+        assert call.kwargs["load_state"] is False, (
+            f"Context was constructed with load_state={call.kwargs['load_state']} for `lint --local`"
+        )
+    mock.assert_not_called()
 
 
 @pytest.mark.parametrize("command", ["format"])
