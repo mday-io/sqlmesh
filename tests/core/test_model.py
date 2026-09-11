@@ -9748,6 +9748,122 @@ def test_resolve_table(make_snapshot: t.Callable):
         assert post_statements[0].sql() == f'"main"."sqlmesh__schema"."schema__parent__{version}"'
 
 
+def test_resolve_table_large_environment(make_snapshot: t.Callable, mocker: MockerFixture):
+    """`_resolve_table` should only build a mapping for the one table being resolved, not the
+    entire environment (https://github.com/SQLMesh/sqlmesh/issues/6017)."""
+
+    @macro()
+    def resolve_named(evaluator, name):
+        return evaluator.resolve_table(name.name)
+
+    target = load_sql_based_model(d.parse("MODEL (name target); SELECT 1 AS c"))
+    target_snapshot = make_snapshot(target)
+    target_snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    snapshots = {'"target"': target_snapshot}
+    for i in range(50):
+        other = load_sql_based_model(d.parse(f"MODEL (name other_{i}); SELECT 1 AS c"))
+        other_snapshot = make_snapshot(other)
+        other_snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+        snapshots[f'"other_{i}"'] = other_snapshot
+
+    child = load_sql_based_model(
+        d.parse(
+            """
+            MODEL (name child);
+            SELECT c FROM target;
+            @resolve_named('target')
+            """
+        )
+    )
+
+    spy = mocker.spy(exp, "replace_tables")
+
+    post_statements = child.render_post_statements(snapshots=snapshots)
+    assert len(post_statements) == 1
+    assert post_statements[0].sql() == f'"sqlmesh__default"."target__{target_snapshot.version}"'
+
+    # every replace_tables call made while resolving the single `target` reference should only
+    # ever see that one mapping entry, not all 51 snapshots in the environment
+    for call in spy.call_args_list:
+        assert len(call.args[1]) <= 1
+
+    # an explicit table_mapping entry takes precedence over the snapshot-derived one (rendered
+    # via a separate model instance so the statement-render cache doesn't return the earlier result)
+    child_for_override = load_sql_based_model(
+        d.parse(
+            """
+            MODEL (name child_override);
+            SELECT c FROM target;
+            @resolve_named('target')
+            """
+        )
+    )
+    override = child_for_override.render_post_statements(
+        snapshots=snapshots, table_mapping={'"target"': "overridden_table"}
+    )
+    assert override[0].sql() == '"overridden_table"'
+
+    # a name absent from both snapshots and table_mapping resolves unchanged
+    unmapped = load_sql_based_model(
+        d.parse(
+            """
+            MODEL (name unmapped_child);
+            SELECT 1 AS c;
+            @resolve_named('does_not_exist')
+            """
+        )
+    )
+    unmapped_result = unmapped.render_post_statements(snapshots=snapshots)
+    assert unmapped_result[0].sql() == '"does_not_exist"'
+
+
+def test_render_virtual_properties_skips_mapping_without_table_refs(
+    make_snapshot: t.Callable, mocker: MockerFixture
+):
+    """Rendering a property expression with no table references shouldn't build the full
+    snapshot -> table-name mapping at all (https://github.com/SQLMesh/sqlmesh/issues/6017)."""
+    import sqlmesh.core.snapshot as snapshot_module
+
+    model = load_sql_based_model(
+        d.parse(
+            """
+            MODEL (
+                name test_schema.test_model,
+                virtual_properties (
+                    labels = [('team', 'data')]
+                ),
+                session_properties (
+                    "spark.executor.memory" = '1G'
+                ),
+            );
+            SELECT a FROM tbl;
+            """
+        )
+    )
+
+    snapshots = {}
+    for i in range(50):
+        other = load_sql_based_model(d.parse(f"MODEL (name other_{i}); SELECT 1 AS c"))
+        other_snapshot = make_snapshot(other)
+        other_snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+        snapshots[f'"other_{i}"'] = other_snapshot
+
+    to_table_mapping_spy = mocker.spy(snapshot_module, "to_table_mapping")
+
+    assert model.render_virtual_properties(snapshots=snapshots) == {
+        "labels": exp.maybe_parse("[('team', 'data')]")
+    }
+    assert model.render_session_properties(snapshots=snapshots) == {
+        "spark.executor.memory": "1G",
+    }
+
+    # `this_model` resolution may still make a narrow, single-snapshot (or empty) call, but the
+    # full N-snapshot mapping build in `_resolve_tables` must never fire for a table-less property
+    for call in to_table_mapping_spy.call_args_list:
+        assert len(call.args[0]) <= 1
+
+
 def test_cluster_with_complex_expression():
     expressions = d.parse(
         """
