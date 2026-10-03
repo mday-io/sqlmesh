@@ -417,7 +417,8 @@ class ClickhouseEngineAdapter(EngineAdapterWithIndexSupport, LogicalMergeMixin):
     ) -> exp.Alter:
         alter_expr = exp.Alter(this=target_table, kind="TABLE")
 
-        for partition in partitions_to_replace:
+        # sort so the generated ALTER is deterministic regardless of set iteration order
+        for partition in sorted(partitions_to_replace, key=str):
             alter_expr.append(
                 "actions",
                 exp.ReplacePartition(
@@ -428,7 +429,7 @@ class ClickhouseEngineAdapter(EngineAdapterWithIndexSupport, LogicalMergeMixin):
                 ),
             )
 
-        for partition in partitions_to_drop:
+        for partition in sorted(partitions_to_drop, key=str):
             alter_expr.append(
                 "actions",
                 exp.DropPartition(
