@@ -11,7 +11,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        revision: [target-only, isolated, collect]
+        revision: [whole-file, per-test]
+        python: ['3.9', '3.12']
     runs-on: ${{ matrix.os }}
     env:
       PYTEST_XDIST_AUTO_NUM_WORKERS: 2
@@ -25,12 +26,12 @@ jobs:
           path: harness
       - uses: actions/checkout@v7
         with:
-          ref: cc8d8b0a6ea97671f81f0be48a58ec1e4607344f
+          ref: cb737168d935e42d93cf297a9840b64b23515caf
           path: source
           fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python }}
       - uses: astral-sh/setup-uv@v7
       - name: Install Linux diagnostic dependencies
         if: runner.os != 'Windows'
@@ -45,20 +46,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,web,slack,dlt,lsp]" ./examples/custom_materializations
-      - name: Enable native crash capture
-        run: |
-          sudo sysctl -w kernel.core_pattern=/tmp/sqlmesh-core-%p
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gdb
       - name: Run bounded diagnostic comparisons
         working-directory: source
         shell: bash
         run: |
-          ulimit -c 1048576
-          python ../harness/diagnostics/linux_minimize.py ${{ matrix.revision }}
+          python ../harness/diagnostics/per_test_fork.py ${{ matrix.revision }}
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: diagnosis-${{ matrix.os }}-${{ matrix.revision }}
+          name: diagnosis-${{ matrix.python }}-${{ matrix.revision }}
           path: source/diagnosis-output/
           retention-days: 7
