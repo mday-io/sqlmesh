@@ -1,0 +1,57 @@
+name: Diagnose SQLMesh CI failures
+on:
+  push:
+    branches: [diagnostic/6051-ci-20261013]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        revision: [base, head]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTEST_XDIST_AUTO_NUM_WORKERS: 2
+      PYTHONFAULTHANDLER: 1
+    steps:
+      - name: Enable Windows symlinks
+        if: runner.os == 'Windows'
+        run: git config --global core.symlinks true
+      - uses: actions/checkout@v7
+        with:
+          path: harness
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.revision == 'base' && 'cc8d8b0a6ea97671f81f0be48a58ec1e4607344f' || '4ef4829dd39002d622ec38a4cf2c047a30a19bdb' }}
+          path: source
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+      - name: Install Linux diagnostic dependencies
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: source
+        run: |
+          uv pip install --system -e ".[dev,web,slack,dlt,lsp]" ./examples/custom_materializations
+      - name: Install Windows diagnostic dependencies
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: source
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,web,slack,dlt,lsp]" ./examples/custom_materializations
+      - name: Run bounded diagnostic comparisons
+        working-directory: source
+        shell: bash
+        run: python ../harness/diagnostics/run.py ${{ matrix.revision }}
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diagnosis-${{ matrix.os }}-${{ matrix.revision }}
+          path: source/diagnosis-output/
+          retention-days: 7
