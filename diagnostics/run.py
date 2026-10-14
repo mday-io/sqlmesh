@@ -8,6 +8,8 @@ provenance={'revision_label':sys.argv[1],'head':subprocess.check_output(['git','
 commands=[('requirements',[sys.executable,'-m','pytest','tests/core/test_context.py::test_requirements','-vv','-s','-p','requirements_probe','--requirements-probe-json',str(out/'requirements-probe.jsonl')])] if os.name=='nt' else [('isolated',[sys.executable,'-m','pytest','-m','isolated and not pyspark','-v','-s']),('parallel-fresh',[sys.executable,'-m','pytest','tests/test_forking.py','-vv','-s'])]
 commands = [('warm-cache',[sys.executable,'-c',"import sqlmesh.core.constants as c; c.MAX_FORK_WORKERS=1; from sqlmesh import Context; ctx=Context(paths='examples/sushi'); print(len(ctx.models))"])] + commands if os.name!='nt' else commands
 commands = commands + [(f'warm-isolated-{i}',[sys.executable,'-m','pytest','-m','isolated and not pyspark','-v','-s']) for i in range(1,11)] if os.name!='nt' else commands
+if os.name=='nt':
+ commands.append(('requirements-corrected-expectation',[sys.executable,str(harness/'verify_requirements_correction.py')]))
 results=[]
 for label,args in commands:
  with (out/(label+'.log')).open('w') as f:
