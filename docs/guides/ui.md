@@ -53,6 +53,14 @@ Navigate to the URL by clicking the link in your terminal (if supported) or copy
 
 ![SQLMesh web UI startup in browser](./ui/ui-quickstart_ui-startup.png){ loading=lazy }
 
+### Cross-origin requests
+
+To protect against cross-site request forgery, the UI server rejects state-changing requests (such as applying a plan) that a browser sends from a different origin than the one the UI is served from. If you serve the UI frontend from a different origin than the API (for example, behind a reverse proxy that rewrites the `Host` header), list the frontend's origins in the `TRUSTED_ORIGINS` environment variable, separated by commas:
+
+```bash
+TRUSTED_ORIGINS="https://sqlmesh.example.com" sqlmesh ui
+```
+
 ## Modules
 
 The UI consists of modules that contain different functionality, and sets of modules are grouped into "modes" (learn more about modes [below](#modes)).

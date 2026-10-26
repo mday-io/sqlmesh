@@ -1,5 +1,6 @@
 import asyncio
 import mimetypes
+import os
 import pathlib
 import threading
 from collections.abc import AsyncIterator
@@ -12,6 +13,7 @@ from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 
 from web.server.api.endpoints import api_router
 from web.server.console import api_console
+from web.server.csrf import CrossOriginProtectionMiddleware
 from web.server.exceptions import ApiException
 from web.server.settings import get_context_or_raise, get_settings
 from web.server.watcher import watch_project
@@ -41,6 +43,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator:
 
 def create_app() -> FastAPI:
     app = FastAPI(lifespan=lifespan)
+    app.add_middleware(
+        CrossOriginProtectionMiddleware,
+        trusted_origins=[
+            o.strip() for o in os.getenv("TRUSTED_ORIGINS", "").split(",") if o.strip()
+        ],
+    )
 
     app.include_router(api_router, prefix="/api")
     WEB_DIRECTORY = pathlib.Path(__file__).parent.parent

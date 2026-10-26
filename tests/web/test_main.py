@@ -14,7 +14,7 @@ from sqlmesh.core.context import Context
 from sqlmesh.core.environment import Environment
 from sqlmesh.utils.errors import PlanError
 from web.server.api.endpoints.files import _get_file_with_content
-from web.server.settings import get_settings
+from web.server.settings import Settings, get_settings
 
 pytestmark = pytest.mark.web
 
@@ -371,6 +371,65 @@ def test_apply(client: TestClient, project_tmp_path: Path) -> None:
     client.app.state.circuit_breaker = threading.Event()  # type: ignore
     response = client.post("/api/commands/apply", json={"environment": "dev"})
     assert response.status_code == 204
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Origin": "https://evil.example"},
+        {"Origin": "null"},
+        {"Origin": "http://testserver", "Sec-Fetch-Site": "cross-site"},
+        {"Sec-Fetch-Site": "same-site"},
+        {"Origin": "https://evil.example", "Content-Type": "application/x-www-form-urlencoded"},
+    ],
+)
+def test_apply_rejects_cross_origin_request(
+    client: TestClient, project_tmp_path: Path, mocker: MockerFixture, headers: dict
+) -> None:
+    run_plan_apply = mocker.patch("web.server.api.endpoints.commands.run_plan_apply")
+    client.app.state.circuit_breaker = threading.Event()  # type: ignore
+    response = client.post("/api/commands/apply", headers=headers)
+    assert response.status_code == 403
+    assert response.json()["message"] == "Cross-origin request rejected"
+    run_plan_apply.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"Origin": "http://testserver"},
+        {"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"},
+        {"Sec-Fetch-Site": "none"},
+    ],
+)
+def test_apply_allows_same_origin_request(
+    client: TestClient, project_tmp_path: Path, headers: dict
+) -> None:
+    client.app.state.circuit_breaker = threading.Event()  # type: ignore
+    response = client.post("/api/commands/apply", json={"environment": "dev"}, headers=headers)
+    assert response.status_code == 204
+
+
+def test_cross_origin_get_allowed(client: TestClient) -> None:
+    response = client.get("/health", headers={"Origin": "https://evil.example"})
+    assert response.status_code == 200
+
+
+def test_trusted_origins(monkeypatch: pytest.MonkeyPatch, project_tmp_path: Path) -> None:
+    from web.server.main import create_app
+
+    monkeypatch.setenv("TRUSTED_ORIGINS", "https://ui.example.com/, https://other.example.com")
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(project_path=project_tmp_path)
+    client = TestClient(app)
+
+    headers = {"Origin": "https://ui.example.com", "Sec-Fetch-Site": "cross-site"}
+    response = client.post("/api/plan/cancel", headers=headers)
+    assert response.status_code == 204
+
+    response = client.post("/api/plan/cancel", headers={"Origin": "https://evil.example"})
+    assert response.status_code == 403
 
 
 @pytest.mark.skip(
