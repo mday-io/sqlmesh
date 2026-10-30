@@ -118,12 +118,25 @@ class ClickhouseEngineAdapter(EngineAdapterWithIndexSupport, LogicalMergeMixin):
 
         mapped_catalogs = {self._default_catalog, *mapping}
         query = query.copy()
+        # A four-part column is only catalog-qualified when its prefix names a table source visible
+        # from its SELECT. Otherwise it is ClickHouse nested-field access, such as t.payload.user.id.
+        table_references: t.Set[t.Tuple[t.Optional[int], str, str, str]] = set()
         for table in query.find_all(exp.Table):
-            if not table.catalog or (preserve_unmapped and table.catalog not in mapped_catalogs):
+            if not table.catalog:
+                continue
+            select = table.find_ancestor(exp.Select)
+            table_references.add(
+                (id(select) if select else None, table.catalog, table.db, table.name)
+            )
+            if preserve_unmapped and table.catalog not in mapped_catalogs:
                 continue
             self._map_catalog_reference(table)
         for column in query.find_all(exp.Column):
-            if not column.catalog or (preserve_unmapped and column.catalog not in mapped_catalogs):
+            if (
+                not column.catalog
+                or not self._references_visible_table(column, table_references)
+                or (preserve_unmapped and column.catalog not in mapped_catalogs)
+            ):
                 continue
             table = self._map_catalog_reference(
                 exp.Table(
@@ -136,6 +149,20 @@ class ClickhouseEngineAdapter(EngineAdapterWithIndexSupport, LogicalMergeMixin):
                 value = table.args.get(table_key)
                 column.set(column_key, value.copy() if value is not None else None)
         return query
+
+    @staticmethod
+    def _references_visible_table(
+        column: exp.Column, table_references: t.Set[t.Tuple[t.Optional[int], str, str, str]]
+    ) -> bool:
+        """Whether the column's prefix names a table in its own SELECT or an enclosing one."""
+        select = column.find_ancestor(exp.Select)
+        while True:
+            key = (id(select) if select else None, column.catalog, column.db, column.table)
+            if key in table_references:
+                return True
+            if select is None:
+                return False
+            select = select.find_ancestor(exp.Select)
 
     def _map_catalog_reference(self, table: exp.Table) -> exp.Table:
         """Map catalog.schema.table to a ClickHouse DataLakeCatalog database.table reference."""

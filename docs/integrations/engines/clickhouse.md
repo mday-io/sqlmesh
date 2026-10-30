@@ -507,6 +507,27 @@ passed directly to the ClickHouse adapter or map `INSERT` targets.
 View creation rejects a source that uses another catalog when a virtual catalog is injected, even
 if the mapping includes that source. Mapped-source views work when no virtual catalog is injected.
 
+A column reference is treated as catalog-qualified only when its first three parts match a
+catalog-qualified table in the same `SELECT` or an enclosing one, such as
+`lake.analytics.orders.id` with `FROM lake.analytics.orders`. SQLMesh leaves other multi-part column references, such as
+ClickHouse nested-field access like `t.payload.user.id`, unchanged.
+
+#### Limitations
+
+The mapping applies only to query rendering. Metadata operations do not apply it, including
+column lookups, table existence checks, and `sqlmesh create_external_models`. Those operations
+see `lake.analytics.orders` as an unmapped three-level name, so they cannot inspect the
+DataLakeCatalog table.
+
+SQLMesh requires every model name in a project to have the same number of parts. In a
+ClickHouse-only project, model names have two parts (`database.table`), so you cannot declare a
+three-part mapped source like `lake.analytics.orders` as an [external model](../../concepts/models/external_models.md)
+with columns. Loading fails with an error about the schema's nesting level. Reference the mapped
+source directly in model queries instead. SQLMesh then has no column types for that source, so
+declare the model's column types explicitly where you need them. When ClickHouse runs alongside a
+catalog-aware gateway, the [injected virtual catalog](#multi-gateway-setup) gives every model
+three parts.
+
 ## Local/Built-in Scheduler
 
 **Engine Adapter Type**: `clickhouse`

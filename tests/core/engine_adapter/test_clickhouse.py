@@ -2415,3 +2415,81 @@ def test_virtual_catalog_execute_uses_configured_catalog_fallback(
         '"other_catalog"."otherdb"."source"."id"'
     ]
     assert query == original
+
+
+@pytest.mark.parametrize("inject_catalog", [False, True])
+@pytest.mark.parametrize("operation", ["ctas", "insert", "insert_select", "fetch"])
+def test_clickhouse_datalake_mapping_preserves_nested_field_access(
+    make_mocked_engine_adapter: t.Callable, inject_catalog: bool, operation: str
+):
+    adapter = make_mocked_engine_adapter(
+        ClickhouseEngineAdapter, datalake_catalog_mapping={"lake": "iceberg"}
+    )
+    if inject_catalog:
+        adapter.inject_virtual_catalog("clickhouse_gw")
+    target = "__clickhouse_gw__.analytics.target" if inject_catalog else "analytics.target"
+    # `lake` is an alias here, not the mapped catalog, so `lake.payload.user.id` is a nested field.
+    select_sql = (
+        "SELECT t.payload.user.id AS user_id, lake.payload.user.id AS other_id, e.id "
+        "FROM db.src AS t JOIN db.other AS lake ON TRUE JOIN lake.source.events AS e ON TRUE"
+    )
+    expected_select = (
+        'SELECT "t"."payload"."user"."id" AS "user_id", '
+        '"lake"."payload"."user"."id" AS "other_id", "e"."id" '
+        'FROM "db"."src" AS "t" JOIN "db"."other" AS "lake" ON TRUE '
+        'JOIN "iceberg"."source.events" AS "e" ON TRUE'
+    )
+    query = parse_one(select_sql, dialect="clickhouse")
+    columns_to_types = {
+        "user_id": exp.DataType.build("Int64", dialect="clickhouse"),
+        "other_id": exp.DataType.build("Int64", dialect="clickhouse"),
+        "id": exp.DataType.build("Int64", dialect="clickhouse"),
+    }
+
+    if operation == "ctas":
+        adapter.ctas(target, query, columns_to_types)
+    elif operation == "insert":
+        adapter.insert_append(target, query, columns_to_types, track_rows_processed=False)
+    elif operation == "insert_select":
+        adapter.execute(
+            parse_one(f"INSERT INTO analytics.target {select_sql}", dialect="clickhouse")
+        )
+    else:
+        adapter.fetchall(query, quote_identifiers=True)
+
+    assert expected_select in "\n".join(to_sql_calls(adapter))
+
+
+@pytest.mark.parametrize(
+    "query_sql, expected_sql",
+    [
+        (
+            "WITH c AS (SELECT * FROM lake.a.b) SELECT lake.a.b.x FROM db.t AS lake",
+            'WITH "c" AS (SELECT * FROM "iceberg"."a.b") '
+            'SELECT "lake"."a"."b"."x" FROM "db"."t" AS "lake"',
+        ),
+        (
+            "SELECT lake.a.b.x FROM db.t AS lake WHERE EXISTS (SELECT 1 FROM lake.a.b)",
+            'SELECT "lake"."a"."b"."x" FROM "db"."t" AS "lake" '
+            'WHERE EXISTS(SELECT 1 FROM "iceberg"."a.b")',
+        ),
+        (
+            "SELECT 1 FROM lake.a.b WHERE EXISTS (SELECT lake.a.b.x FROM db.t)",
+            'SELECT 1 FROM "iceberg"."a.b" WHERE EXISTS(SELECT "iceberg"."a.b"."x" FROM "db"."t")',
+        ),
+        (
+            'SELECT "lake"."a"."b"."x" FROM "lake"."a"."b"',
+            'SELECT "iceberg"."a.b"."x" FROM "iceberg"."a.b"',
+        ),
+    ],
+)
+def test_clickhouse_datalake_mapping_scopes_column_references_to_select(
+    make_mocked_engine_adapter: t.Callable, query_sql: str, expected_sql: str
+):
+    adapter = make_mocked_engine_adapter(
+        ClickhouseEngineAdapter, datalake_catalog_mapping={"lake": "iceberg"}
+    )
+
+    adapter.fetchall(parse_one(query_sql, dialect="clickhouse"), quote_identifiers=True)
+
+    assert to_sql_calls(adapter) == [expected_sql]
